@@ -1,0 +1,5 @@
+icrawler
+openai
+Pillow
+tqdm
+requests
