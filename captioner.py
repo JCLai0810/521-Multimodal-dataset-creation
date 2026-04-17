@@ -14,7 +14,7 @@ Prerequisites:
        pip install -r requirements.txt
 
 Usage:
-    python captioner.py [--images-dir images] [--output dataset.jsonl]
+    python captioner.py [--images-dir images] [--output dataset.jsonl] [--output-txt dataset.txt]
                         [--base-url http://localhost:8080]
                         [--model gemma-4]
                         [--overwrite]
@@ -47,20 +47,23 @@ IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
 # Captioning prompt
 # ---------------------------------------------------------------------------
 SYSTEM_PROMPT = (
-    "You are an expert annotator for a Malaysian cultural and geographical image dataset. "
-    "Your task is to produce a single, detailed, factual English caption for each image. "
-    "The caption should:\n"
-    "  • Identify the specific Malaysian location, food, cultural element, or wildlife shown.\n"
-    "  • Describe visual attributes: colours, textures, composition, time of day, weather.\n"
-    "  • Mention any recognisable landmarks, signs, people (without identifying them), or activities.\n"
-    "  • Be between 2 and 5 sentences long.\n"
-    "  • Never start with 'This image shows' or 'The image depicts'.\n"
-    "Return ONLY the caption text, no preamble or JSON."
+    "You are a professional image annotator for a Malaysian cultural dataset. "
+    "Generate EXACTLY 5 distinct English captions for each image.\n\n"
+    "Each caption must:\n"
+    "- Describe Malaysian culture, place, food, people, or nature if visible.\n"
+    "- Be factual, visual, and specific (colors, objects, setting, activity).\n"
+    "- Be different in focus and wording from the others.\n"
+    "- Be 1 sentences long.\n"
+    "- NEVER start with 'This image shows' or similar phrases.\n\n"
+    "Output rules:\n"
+    "- Return ONLY the 5 captions.\n"
+    "- One caption per line.\n"
+    "- No numbering, bullets, or extra text."
 )
 
 USER_PROMPT = (
-    "Please provide a detailed and accurate caption for this image. "
-    "Focus on anything that is specifically Malaysian."
+    "Please provide 5 distinct, detailed, and accurate captions for this image. "
+    "Focus on anything that is specifically Malaysian. Separate each caption with a new line."
 )
 
 # Sentence-ending punctuation — used to detect truncated captions
@@ -109,8 +112,8 @@ def encode_image_base64(image_path: Path, max_size: int = 1024) -> tuple[str, st
     return encoded, "image/jpeg"
 
 
-def caption_image(client: OpenAI, model: str, image_path: Path) -> str | None:
-    """Send one image to the llama.cpp Gemma 4 server and return the caption.
+def caption_image(client: OpenAI, model: str, image_path: Path) -> list[str] | None:
+    """Send one image to the llama.cpp Gemma 4 server and return a list of 5 captions.
 
     Returns None if the model returns an empty or truncated response.
     """
@@ -124,8 +127,6 @@ def caption_image(client: OpenAI, model: str, image_path: Path) -> str | None:
                 "role": "user",
                 "content": [
                     {
-                        # NOTE: do NOT pass 'detail' – llama.cpp does not
-                        # support it and returns an empty completion.
                         "type": "image_url",
                         "image_url": {
                             "url": f"data:{mime};base64,{b64}",
@@ -135,8 +136,8 @@ def caption_image(client: OpenAI, model: str, image_path: Path) -> str | None:
                 ],
             },
         ],
-        max_tokens=1024,   # raised from 512 to avoid mid-sentence cutoff
-        temperature=0.3,
+        max_tokens=1500,   # Raised to accommodate 5 captions
+        temperature=0.5,   # Raised slightly to encourage variety between the 5 captions
     )
 
     choice = response.choices[0]
@@ -148,8 +149,6 @@ def caption_image(client: OpenAI, model: str, image_path: Path) -> str | None:
         image_path.name, finish_reason, raw,
     )
 
-    # finish_reason == 'length' means the token budget was exhausted
-    # before the model finished the sentence — treat as failure.
     if finish_reason == "length":
         logger.warning(
             "Caption truncated (hit max_tokens) for %s — will retry.",
@@ -157,27 +156,34 @@ def caption_image(client: OpenAI, model: str, image_path: Path) -> str | None:
         )
         return None
 
-    caption = strip_markdown((raw or "").strip())
+    if not raw:
+        return None
 
-    if not caption:
+    # Process the raw output into individual lines, stripping markdown/numbers
+    raw_lines = raw.strip().split('\n')
+    captions = []
+    
+    for line in raw_lines:
+        cleaned = strip_markdown(line)
+        if cleaned:
+            captions.append(cleaned)
+
+    if not captions:
+        logger.warning("Empty captions received for %s", image_path.name)
+        return None
+
+    # Warn if the last caption doesn't end with sentence-closing punctuation
+    if not _SENTENCE_ENDINGS.search(captions[-1]):
         logger.warning(
-            "Empty caption received for %s — model returned: %r",
+            "Last caption for %s may be incomplete (no sentence-ending punctuation): %r",
             image_path.name,
-            raw,
+            captions[-1],
         )
         return None
 
-    # Warn if the caption doesn't end with sentence-closing punctuation
-    # (may indicate a subtle truncation llama.cpp didn't report as 'length')
-    if not _SENTENCE_ENDINGS.search(caption):
-        logger.warning(
-            "Caption for %s may be incomplete (no sentence-ending punctuation): %r",
-            image_path.name,
-            caption,
-        )
-        return None
-
-    return caption
+    # We asked for 5, but the model might give slightly more or less.
+    # To be safe, let's limit to the first 5 if it over-generated, or just return what it gave.
+    return captions[:5]
 
 
 def collect_images(images_dir: Path) -> list[Path]:
@@ -190,12 +196,7 @@ def collect_images(images_dir: Path) -> list[Path]:
 
 
 def load_existing_captions(output_path: Path) -> set[str]:
-    """Load already-captioned image paths from an existing JSONL file.
-
-    Only records with a non-empty caption are considered done.
-    Records with empty captions (from a previous failed run) will be
-    re-processed.
-    """
+    """Load already-captioned image paths from an existing JSONL file."""
     done: set[str] = set()
     if output_path.exists():
         with output_path.open("r", encoding="utf-8") as f:
@@ -205,7 +206,10 @@ def load_existing_captions(output_path: Path) -> set[str]:
                     continue
                 try:
                     record = json.loads(line)
-                    if record.get("caption", "").strip():
+                    # Check for either the new list format or old single format
+                    if "captions" in record and record["captions"]:
+                        done.add(record["image"])
+                    elif record.get("caption", "").strip():
                         done.add(record["image"])
                 except (json.JSONDecodeError, KeyError):
                     pass
@@ -229,10 +233,16 @@ def main() -> None:
         help="Output JSONL file path (default: dataset.jsonl).",
     )
     parser.add_argument(
+        "--output-txt",
+        type=str,
+        default="dataset.txt",
+        help="Output TXT file path for flat list (default: dataset.txt).",
+    )
+    parser.add_argument(
         "--base-url",
         type=str,
-        default="http://localhost:8080/v1",
-        help="Base URL for the llama.cpp OpenAI-compatible server (default: http://localhost:8080/v1).",
+        default="http://127.0.0.1:8080/v1",
+        help="Base URL for the llama.cpp OpenAI-compatible server (default: http://127.0.0.1:8080/v1).",
     )
     parser.add_argument(
         "--model",
@@ -261,12 +271,12 @@ def main() -> None:
 
     images_dir = Path(args.images_dir)
     output_path = Path(args.output)
+    output_txt_path = Path(args.output_txt)
 
     if not images_dir.exists():
         logger.error("Images directory not found: %s", images_dir)
         sys.exit(1)
 
-    # Collect all images
     all_images = collect_images(images_dir)
     if not all_images:
         logger.error("No images found in %s", images_dir)
@@ -274,34 +284,32 @@ def main() -> None:
 
     logger.info("Found %d images in %s", len(all_images), images_dir)
 
-    # Skip images already captioned (resume support)
     already_done: set[str] = set()
     if not args.overwrite:
         already_done = load_existing_captions(output_path)
         logger.info("Skipping %d already-captioned images.", len(already_done))
 
-    # Build the OpenAI client pointing to the llama.cpp server
     client = OpenAI(
         base_url=args.base_url,
-        api_key="sk-no-key-required",  # llama.cpp doesn't require a real key
+        api_key="sk-no-key-required",
     )
 
     logger.info("Connecting to llama.cpp server at %s", args.base_url)
     logger.info("Using model: %s", args.model)
 
-    # Open output file in append mode so we can resume
     successes = 0
     errors = 0
 
-    with output_path.open("a", encoding="utf-8") as out_f:
+    # Open both JSONL and TXT files in append mode
+    with output_path.open("a", encoding="utf-8") as out_json, \
+         output_txt_path.open("a", encoding="utf-8") as out_txt:
+        
         for img_path in tqdm(all_images, desc="Captioning", unit="img"):
-            # Use forward-slash relative path as the image key
             relative_path = img_path.as_posix()
 
             if relative_path in already_done:
                 continue
 
-            # Validate image before sending
             try:
                 with Image.open(img_path) as _:
                     pass
@@ -310,29 +318,25 @@ def main() -> None:
                 errors += 1
                 continue
 
-            # Attempt captioning with retries
-            caption = None
+            captions = None
             for attempt in range(1, args.max_retries + 1):
                 try:
-                    caption = caption_image(client, args.model, img_path)
-                    break
+                    captions = caption_image(client, args.model, img_path)
+                    if captions:
+                        break
                 except Exception as exc:
                     logger.warning(
                         "Attempt %d/%d failed for %s: %s",
-                        attempt,
-                        args.max_retries,
-                        img_path.name,
-                        exc,
+                        attempt, args.max_retries, img_path.name, exc,
                     )
                     if attempt < args.max_retries:
                         time.sleep(args.retry_delay * attempt)
 
-            if caption is None:
+            if not captions:
                 logger.error("Failed to caption: %s", img_path)
                 errors += 1
                 continue
 
-            # Derive category from folder structure: images/<category>/<keyword>/file.jpg
             parts = img_path.parts
             try:
                 images_idx = parts.index(images_dir.name)
@@ -342,24 +346,30 @@ def main() -> None:
                 category = "unknown"
                 keyword_folder = "unknown"
 
+            # 1. Write to JSONL File
             record = {
                 "image": relative_path,
-                "caption": caption,
+                "captions": captions, # Changed from single string to a list of strings
                 "category": category,
                 "keyword": keyword_folder.replace("_", " "),
             }
+            out_json.write(json.dumps(record, ensure_ascii=False) + "\n")
+            out_json.flush()
 
-            out_f.write(json.dumps(record, ensure_ascii=False) + "\n")
-            out_f.flush()
+            # 2. Write to the extra TXT File
+            for cap in captions:
+                # Format: filename Caption 1...
+                out_txt.write(f"{img_path.name} {cap}\n")
+            out_txt.flush()
+            
             successes += 1
 
     logger.info(
-        "Captioning complete. Successes: %d | Errors: %d | Output: %s",
-        successes,
-        errors,
-        output_path.resolve(),
+        "Captioning complete. Successes: %d | Errors: %d",
+        successes, errors
     )
-
+    logger.info("JSON Output saved to: %s", output_path.resolve())
+    logger.info("TXT Output saved to: %s", output_txt_path.resolve())
 
 if __name__ == "__main__":
     main()
