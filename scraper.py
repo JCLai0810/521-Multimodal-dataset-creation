@@ -22,6 +22,7 @@ import sys
 from pathlib import Path
 
 from icrawler.builtin import BingImageCrawler, GoogleImageCrawler
+import time
 
 logging.basicConfig(
     level=logging.INFO,
@@ -29,6 +30,8 @@ logging.basicConfig(
     handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger(__name__)
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png"}
 
 # ---------------------------------------------------------------------------
 # Keyword catalogue – categories of Malaysian subjects
@@ -49,12 +52,12 @@ KEYWORDS: dict[str, list[str]] = {
     "food": [
         "Nasi Lemak Malaysia",
         "Char Kway Teow Penang",
-        "Roti Canai Malaysia",
-        "Laksa Sarawak",
+        "Roti Canai breakfast with Teh Tarik glass Malaysia",
+        "Laksa Malaysia",
         "Satay Malaysia grilled",
-        "Cendol Malaysia dessert",
+        "Cendol Penang and Melaka Malaysia",
         "Rendang Malaysia beef",
-        "Wantan Mee Malaysia noodles",
+        "Curry Mee Malaysia noodles",
         "Apam Balik Malaysia pancake",
         "Durian Malaysia fruit",
     ],
@@ -70,26 +73,41 @@ KEYWORDS: dict[str, list[str]] = {
         "Sekinchan paddy fields Malaysia",
         "Mossy Forest Cameron Highlands",
     ],
-    "culture": [
+   "culture": [
         "Malaysia traditional Batik fabric",
         "Malay traditional house kampung",
         "Hari Raya celebration Malaysia",
         "Chinese New Year Malaysia parade",
-        "Deepavali light festival Malaysia",
+        "Penang Little India Deepavali night lights in Malaysia",
         "Gawai harvest festival Sarawak",
         "Wau Bulan Malaysian kite",
         "Silat martial art Malaysia",
         "Malaysia national costume Baju Melayu",
-        "Orang Asli indigenous Malaysia",
+        "Batu Caves festival crowd Malaysia",
     ],
-    "cityscape": [
+   "cityscape": [
         "Kuala Lumpur skyline night",
-        "Penang Hill view Malaysia",
-        "Johor Bahru city Malaysia",
-        "Ipoh old town Malaysia",
+        "Kek Lok Si Temple Penang night illumination Malaysia",
+        "Ipoh old town heritage street Malaysia",
         "Kota Bharu Kelantan Malaysia market",
+        "Melaka Straits Mosque sunset or Blue Hour night lights Malaysia",
+        "Darul Hana Bridge Kuching aerial view",
+        "Taiping Lake Gardens scenic view Malaysia",
+        "Kuala Terengganu Crystal Mosque waterfront Malaysia",
+        "Putrajaya lakeside sunset skyline Malaysia",
+        "Penang Hill panoramic view with night view city lights skyline"
     ],
 }
+
+def count_images(folder: Path):
+    return len([p for p in folder.iterdir() if p.suffix.lower() in IMAGE_EXTENSIONS])
+
+def trim_images(folder: Path, target: int):
+    images = sorted([p for p in folder.iterdir() if p.suffix.lower() in IMAGE_EXTENSIONS])
+    if len(images) > target:
+        for img in images[target:]:
+            img.unlink()
+        logger.info("Trimmed to %d images in %s", target, folder)
 
 
 def crawl_category(
@@ -113,25 +131,53 @@ def crawl_category(
 
         logger.info("[%s] Crawling: '%s'  →  %s", category, keyword, kw_dir)
 
-        crawler = CrawlerClass(
-            feeder_threads=1,
-            parser_threads=2,
-            downloader_threads=4,
-            storage={"root_dir": str(kw_dir)},
-        )
+        target = max_num
+        attempt = 0
+        max_attempts = 3
 
-        filters = dict(type="photo", size="large")
+        while count_images(kw_dir) < target and attempt < max_attempts:
 
-        try:
-            crawler.crawl(
-                keyword=keyword,
-                filters=filters,
-                max_num=max_num,
-                min_size=(300, 300),
-                file_idx_offset=0,
+            attempt += 1
+            logger.info(
+                "Attempt %d for '%s' (current: %d/%d)",
+                attempt,
+                keyword,
+                count_images(kw_dir),
+                target,
             )
-        except Exception as exc:
-            logger.warning("Error crawling '%s': %s", keyword, exc)
+
+            crawler = CrawlerClass(
+                feeder_threads=1,
+                parser_threads=2,
+                downloader_threads=6,
+                storage={"root_dir": str(kw_dir)},
+            )
+
+            filters = dict(type="photo", size="large")
+
+            try:
+                crawler.crawl(
+                    keyword=keyword,
+                    filters=filters,
+                    max_num=int(max_num * 2),  # over-fetch
+                    min_size=(300, 300),
+                    file_idx_offset=0,
+                )
+            except Exception as exc:
+                logger.warning("Error crawling '%s': %s", keyword, exc)
+
+            time.sleep(2)  # avoid blocking
+
+        # # Trim to exact number
+        trim_images(kw_dir, target)
+
+        final_count = count_images(kw_dir)
+        if final_count < target:
+            logger.warning(
+                "Only got %d/%d images for '%s'", final_count, target, keyword
+            )
+        else:
+            logger.info("Completed '%s' with %d images", keyword, final_count)
 
 
 def main() -> None:
@@ -141,8 +187,8 @@ def main() -> None:
     parser.add_argument(
         "--max-num",
         type=int,
-        default=30,
-        help="Maximum number of images to download per keyword (default: 30).",
+        default=40,
+        help="Maximum number of images to download per keyword (default: 40).",
     )
     parser.add_argument(
         "--output-dir",
